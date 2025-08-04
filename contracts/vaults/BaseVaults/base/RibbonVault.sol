@@ -309,6 +309,7 @@ contract RibbonVault is
     }
 
     /**
+     * @notice 存款函数，将资产从 msg.sender 转移到合约地址
      * @notice Deposits the `asset` from msg.sender.
      * @param amount is the amount of `asset` to deposit
      */
@@ -349,52 +350,90 @@ contract RibbonVault is
     }
 
     /**
-     * @notice Mints the vault shares to the creditor
+    * @notice Mints the vault shares to the creditor
      * @param amount is the amount of `asset` deposited
      * @param creditor is the address to receieve the deposit
+
+     * @notice 🎯 金库核心存款逻辑 - 为指定用户处理存款并更新状态
+     * @dev 这是所有存款函数的最终执行逻辑，处理金库代币铸造、存款收据管理等
+     * @param amount 用户存入的资产数量（以资产的最小单位计算，如 wei 对于 ETH）
+     * @param creditor 存款受益人地址（通常是 msg.sender，但代理存款时可能不同）
      */
     function _depositFor(uint256 amount, address creditor) private {
+        // 📊 第一步：获取当前轮次信息
+        // 轮次是金库运营的核心概念，每轮通常持续 7 天，对应一个期权周期
         uint256 currentRound = vaultState.round;
+        
+        // 🧮 第二步：计算存款后的金库总资产
+        // totalBalance() 返回当前金库持有的所有资产（已锁定 + 未锁定 + 待处理）
         uint256 totalWithDepositedAmount = totalBalance().add(amount);
 
+        // 🛡️ 第三步：金库级别的安全检查
+        // 检查1：确保存款后不超过金库最大容量限制
         require(totalWithDepositedAmount <= vaultParams.cap, "Exceed cap");
+        
+        // 检查2：确保存款后金库总资产不低于最小供应量（防止某些攻击）
         require(
             totalWithDepositedAmount >= vaultParams.minimumSupply,
             "Insufficient balance"
         );
 
+        // 📢 第四步：发出存款事件，供前端和分析工具使用
         emit Deposit(creditor, amount, currentRound);
 
+        // 📋 第五步：获取用户的历史存款记录
+        // depositReceipts 是一个映射：address => DepositReceipt
+        // 记录了每个用户的存款轮次、金额和未赎回份额
+        // 当访问 mapping 中不存在的 key 时，不会返回 null 或 undefined，而是返回该类型的默认零值
         Vault.DepositReceipt memory depositReceipt = depositReceipts[creditor];
 
-        // If we have an unprocessed pending deposit from the previous rounds, we have to process it.
+        // 🔄 第六步：处理用户在之前轮次的未赎回份额（关键逻辑！）
+        // 当用户存款时，不会立即获得金库代币，而是在下一轮开始时才铸造
+        // 这里计算用户在上轮存款应得但还未赎回的金库代币数量
         uint256 unredeemedShares =
             depositReceipt.getSharesFromReceipt(
-                currentRound,
-                roundPricePerShare[depositReceipt.round],
-                vaultParams.decimals
+                currentRound,                            // 当前轮次
+                roundPricePerShare[depositReceipt.round], // 用户存款轮次的金库代币价格
+                vaultParams.decimals                     // 金库代币小数位数
             );
+        // 计算逻辑：未赎回份额 = 用户存款金额 / 当时的每股价格
+        // 例如：用户在第10轮存款100 ETH，当时价格1.05 ETH/代币 → 95.24个代币待赎回
 
-        uint256 depositAmount = amount;
+        // 📈 第七步：处理本轮存款金额累加
+        uint256 depositAmount = amount;  // 初始化为当前存款金额
 
-        // If we have a pending deposit in the current round, we add on to the pending deposit
+        // 🔍 检查用户是否在当前轮次已有存款
         if (currentRound == depositReceipt.round) {
+            // 如果用户本轮已经存过款，新存款需要累加到之前的金额上
+            // 例如：用户本轮已存入5 ETH，现在再存入3 ETH → 总计8 ETH
             uint256 newAmount = uint256(depositReceipt.amount).add(amount);
             depositAmount = newAmount;
         }
+        // 注意：如果用户是本轮首次存款，depositAmount 保持为 amount
 
+        // ✅ 第八步：数据类型安全检查
+        // 确保存款金额不超过 uint104 的最大值（防止溢出）
         ShareMath.assertUint104(depositAmount);
 
+        // 💾 第九步：更新用户的存款收据（覆盖之前的记录）
         depositReceipts[creditor] = Vault.DepositReceipt({
-            round: uint16(currentRound),
-            amount: uint104(depositAmount),
-            unredeemedShares: uint128(unredeemedShares)
+            round: uint16(currentRound),              // 🕐 存款轮次：当前轮次
+            amount: uint104(depositAmount),           // 💰 存款金额：本轮总存款金额（可能是累加后的）
+            unredeemedShares: uint128(unredeemedShares) // 🎫 未赎回份额：上轮存款产生的待赎回代币
         });
+        // 这个收据的作用：
+        // 1. 记录用户本轮存款的轮次和金额（用于下轮铸造代币）
+        // 2. 记录用户上轮存款产生的待赎回代币（用户可随时领取）
 
+        // 📊 第十步：更新金库全局状态 - 待处理存款总额
         uint256 newTotalPending = uint256(vaultState.totalPending).add(amount);
+        
+        // ✅ 数据类型安全检查
         ShareMath.assertUint128(newTotalPending);
-
+        
+        // 💾 更新金库状态：累加到待处理队列
         vaultState.totalPending = uint128(newTotalPending);
+        // totalPending 的含义：当前轮次所有用户存款的总和，这些资金将在下轮开始时参与期权策略
     }
 
     /**

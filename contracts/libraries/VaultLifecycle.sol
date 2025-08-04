@@ -23,15 +23,28 @@ library VaultLifecycle {
     using SafeMath for uint256;
     using SupportsNonCompliantERC20 for IERC20;
 
+    /**
+     * @notice 关闭当前期权并创建新期权的参数结构体
+     * @dev 这个结构体包含了期权生命周期管理所需的所有关键参数
+     */
     struct CloseParams {
+        // Opyn 协议的期权代币工厂地址，用于创建新的期权合约
         address OTOKEN_FACTORY;
+        // USDC 稳定币地址，期权的计价货币和结算货币
         address USDC;
+        // 当前正在销售的期权合约地址（如果是第一轮则为 address(0)）
         address currentOption;
+        // 从 commitAndClose 到 rollToNextOption 之间的延迟时间（秒，当前设为0）
         uint256 delay;
+        // 最后一次手动覆盖执行价格的轮次号（用于特殊情况下的人工干预）
         uint16 lastStrikeOverrideRound;
+        // 手动设置的覆盖执行价格（当需要人工干预时使用，单位与底层资产相同）
         uint256 overriddenStrikePrice;
+        // 执行价格选择合约地址（Delta-based 或 Manual 策略）
         address strikeSelection;
+        // 期权溢价定价合约地址（基于 Black-Scholes 模型计算理论价值）
         address optionsPremiumPricer;
+        // 期权溢价折扣率（千分位：000-999，例如 950 表示 5% 折扣）
         uint256 premiumDiscount;
     }
 
@@ -46,46 +59,70 @@ library VaultLifecycle {
      * @return otokenAddress is the address of the new option
      * @return strikePrice is the strike price of the new option
      * @return delta is the delta of the new option
+     
+     * @notice 🎯 关闭当前期权轮次并创建下一轮期权的核心函数
+     * @dev 这是 Theta Vault 期权生命周期的关键函数，执行以下操作：
+     *      1. 计算新期权的到期时间（通常为下一个周五）
+     *      2. 通过算法或手动方式选择执行价格
+     *      3. 创建或获取对应的 OToken 合约
+     *      4. 为后续的期权销售做准备
+     * 
+     * @param closeParams 期权关闭参数结构体，包含工厂地址、当前期权等信息
+     * @param vaultParams 金库基本参数（storage 指针，可修改）
+     * @param vaultState 金库状态信息（storage 指针，可修改）
+     * 
+     * @return otokenAddress 新创建或获取的期权合约地址
+     * @return strikePrice 新期权的执行价格（8位小数，如 ETH 价格 3000 * 10^8）
+     * @return delta 期权的 Delta 值（4位小数，如 0.1 delta = 1000）
      */
     function commitAndClose(
-        CloseParams calldata closeParams,
-        Vault.VaultParams storage vaultParams,
-        Vault.VaultState storage vaultState
+        CloseParams calldata closeParams,        // 📋 只读参数：期权关闭相关配置
+        Vault.VaultParams storage vaultParams,   // 🔧 可修改指针：金库基本参数
+        Vault.VaultState storage vaultState      // 📊 可修改指针：金库状态数据
     )
         external
         returns (
-            address otokenAddress,
-            uint256 strikePrice,
-            uint256 delta
+            address otokenAddress,  // 🎫 新创建/获取的期权合约地址
+            uint256 strikePrice,    // 💰 期权执行价格（8位小数）
+            uint256 delta          // 📈 期权Delta值（4位小数）
         )
     {
+        // 🕐 第一步：计算新期权的到期时间（通常为下一个周五 UTC 8:00 AM）
         uint256 expiry = getNextExpiry(closeParams.currentOption);
 
+        // 🎯 第二步：获取执行价格选择器合约实例
         IStrikeSelection selection =
             IStrikeSelection(closeParams.strikeSelection);
 
-        bool isPut = vaultParams.isPut;
-        address underlying = vaultParams.underlying;
-        address asset = vaultParams.asset;
+        // 📋 第三步：从金库参数中读取期权基本信息
+        bool isPut = vaultParams.isPut;             // 是否为看跌期权
+        address underlying = vaultParams.underlying; // 底层资产地址（如 WETH）
+        address asset = vaultParams.asset;           // 抵押资产地址（通常与底层资产相同）
 
+        // 🧮 第四步：选择执行价格 - 使用算法或手动覆盖
         (strikePrice, delta) = closeParams.lastStrikeOverrideRound ==
             vaultState.round
+            // 如果当前轮次有手动覆盖，使用覆盖价格
             ? (closeParams.overriddenStrikePrice, selection.delta())
+            // 否则使用算法计算（Delta-based 策略）
             : selection.getStrikePrice(expiry, isPut);
 
+        // ✅ 验证执行价格有效性
         require(strikePrice != 0, "!strikePrice");
 
-        // retrieve address if option already exists, or deploy it
+        // 🏭 第五步：创建或获取期权合约
+        // 如果相同参数的期权已存在则复用，否则创建新的 OToken
         otokenAddress = getOrDeployOtoken(
-            closeParams,
-            vaultParams,
-            underlying,
-            asset,
-            strikePrice,
-            expiry,
-            isPut
+            closeParams,      // 关闭参数（包含工厂地址等）
+            vaultParams,      // 金库参数
+            underlying,       // 底层资产
+            asset,           // 抵押资产
+            strikePrice,     // 执行价格
+            expiry,          // 到期时间
+            isPut            // 期权类型
         );
 
+        // 🎯 返回新期权的关键信息，供调用合约使用
         return (otokenAddress, strikePrice, delta);
     }
 
@@ -134,13 +171,13 @@ library VaultLifecycle {
      * @param currentQueuedWithdrawShares is amount of queued withdrawals from the current round
      */
     struct RolloverParams {
-        uint256 decimals;
-        uint256 totalBalance;
-        uint256 currentShareSupply;
-        uint256 lastQueuedWithdrawAmount;
-        uint256 performanceFee;
-        uint256 managementFee;
-        uint256 currentQueuedWithdrawShares;
+        uint256 decimals; // 代币的小数位数
+        uint256 totalBalance; // 总余额
+        uint256 currentShareSupply; // 当前份额供应量
+        uint256 lastQueuedWithdrawAmount; // 上一轮的待提取金额
+        uint256 performanceFee; // 性能费用
+        uint256 managementFee; // 管理费用
+        uint256 currentQueuedWithdrawShares; // 当前轮次的待提取份额
     }
 
     /**
@@ -162,12 +199,12 @@ library VaultLifecycle {
         external
         view
         returns (
-            uint256 newLockedAmount,
-            uint256 queuedWithdrawAmount,
-            uint256 newPricePerShare,
-            uint256 mintShares,
-            uint256 performanceFeeInAsset,
-            uint256 totalVaultFee
+            uint256 newLockedAmount, // 新的锁定金额
+            uint256 queuedWithdrawAmount, // 新的待提取金额
+            uint256 newPricePerShare, // 新的价格
+            uint256 mintShares, // 新的份额
+            uint256 performanceFeeInAsset, // 性能费用
+            uint256 totalVaultFee // 总费用
         )
     {
         uint256 currentBalance = params.totalBalance;
@@ -583,21 +620,23 @@ library VaultLifecycle {
         bool isPut
     ) internal returns (address) {
         IOtokenFactory factory = IOtokenFactory(closeParams.OTOKEN_FACTORY);
-
+        // 🔍 第一步：尝试获取已存在的期权合约
         address otokenFromFactory =
             factory.getOtoken(
-                underlying,
-                closeParams.USDC,
-                collateralAsset,
-                strikePrice,
-                expiry,
-                isPut
+                underlying,         // WETH
+                closeParams.USDC,   // USDC 
+                collateralAsset,    // WETH
+                strikePrice,        // 3300 * 10^8
+                expiry,             // 1705737600 (周五时间戳)
+                isPut               // true
             );
 
+        // ✅ 如果已存在相同参数的合约，直接返回（复用）
         if (otokenFromFactory != address(0)) {
             return otokenFromFactory;
         }
 
+        // 🔍 第二步：如果未找到，则创建新的期权合约 opyn 会在链上创建一份新的合约地址
         address otoken =
             factory.createOtoken(
                 underlying,
@@ -866,6 +905,7 @@ library VaultLifecycle {
     {
         // uninitialized state
         if (currentOption == address(0)) {
+            // 如果当前期权合约地址为空，则返回当前周的周五8点
             return getNextFriday(block.timestamp);
         }
         uint256 currentExpiry = IOtoken(currentOption).expiryTimestamp();

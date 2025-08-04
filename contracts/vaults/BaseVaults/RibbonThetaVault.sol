@@ -421,53 +421,93 @@ contract RibbonThetaVault is RibbonVault, RibbonThetaVaultStorage {
     }
 
     /**
-     * @notice Rolls the vault's funds into a new short position.
+     * @notice 🚀 启动新期权轮次的核心函数 - 将金库资金转入新的期权头寸
+     * @dev 这是期权策略执行的关键函数，完成从上轮结算到新轮启动的完整流程
+     * 
+     * 🔄 主要执行步骤：
+     * 1. 处理用户提款队列和金库份额计算
+     * 2. 计算新的金库代币价格和铸造新份额
+     * 3. 收取管理费和性能费
+     * 4. 在 Opyn 协议中创建新的期权头寸
+     * 5. 分配期权给购买队列（机构优先购买）
+     * 6. 启动期权拍卖销售
+     * 
+     * 🛡️ 权限要求：只有 Keeper 可以调用，并且有重入保护
      */
     function rollToNextOption() external onlyKeeper nonReentrant {
+        // 📊 第一步：获取当前轮次排队提款的份额数量
+        // currentQueuedWithdrawShares 记录了本轮用户发起提款请求的金库代币数量
         uint256 currQueuedWithdrawShares = currentQueuedWithdrawShares;
 
+        // 🎯 第二步：执行核心轮次转移逻辑
+        // _rollToNextOption 是最复杂的内部函数，处理：
+        // - 计算新的金库代币价格
+        // - 为新存款铸造金库代币
+        // - 计算并收取各种费用
+        // - 确定新轮次的锁定资金数量
         (
-            address newOption,
-            uint256 lockedBalance,
-            uint256 queuedWithdrawAmount
+            address newOption,       // 🎫 新期权合约地址（由 commitAndClose 创建）
+            uint256 lockedBalance,   // 💰 新轮次锁定的资金数量（用作期权抵押品）
+            uint256 queuedWithdrawAmount // 🚪 排队等待提款的资金总额
         ) =
             _rollToNextOption(
-                lastQueuedWithdrawAmount,
-                currQueuedWithdrawShares
+                lastQueuedWithdrawAmount,    // 上一轮遗留的待提款金额
+                currQueuedWithdrawShares     // 当前轮次新增的待提款份额
             );
 
+        // 📝 第三步：更新提款相关状态变量
+        // 记录本轮次总的待提款金额（包括历史遗留 + 本轮新增）
         lastQueuedWithdrawAmount = queuedWithdrawAmount;
 
+        // 🔄 第四步：更新金库全局提款份额统计
+        // vaultState.queuedWithdrawShares 累加所有等待提款的份额
+        // 这些份额在期权到期后才能真正提取资金
         uint256 newQueuedWithdrawShares =
             uint256(vaultState.queuedWithdrawShares).add(
                 currQueuedWithdrawShares
             );
-        ShareMath.assertUint128(newQueuedWithdrawShares);
+        ShareMath.assertUint128(newQueuedWithdrawShares); // 防止溢出
         vaultState.queuedWithdrawShares = uint128(newQueuedWithdrawShares);
 
+        // 🔄 第五步：清零当前轮次的提款队列
+        // 将本轮的提款份额转移到全局队列后，重置当前计数器
         currentQueuedWithdrawShares = 0;
 
-        ShareMath.assertUint104(lockedBalance);
+        // 💾 第六步：更新金库锁定资金状态
+        // lockedAmount 是当前轮次用作期权抵押品的资金数量
+        ShareMath.assertUint104(lockedBalance); // 防止溢出
         vaultState.lockedAmount = uint104(lockedBalance);
 
+        // 📢 第七步：发出期权头寸开启事件
         emit OpenShort(newOption, lockedBalance, msg.sender);
 
+        // 🏭 第八步：在 Opyn 协议中创建实际的期权头寸
+        // 这一步将锁定的资金存入 Opyn 的 Margin Pool 作为抵押品
+        // 并铸造相应数量的期权代币（OToken）
         uint256 optionsMintAmount =
             VaultLifecycle.createShort(
-                GAMMA_CONTROLLER,
-                MARGIN_POOL,
-                newOption,
-                lockedBalance
+                GAMMA_CONTROLLER,    // Opyn 控制器合约地址
+                MARGIN_POOL,         // Opyn 保证金池地址  
+                newOption,           // 新期权合约地址
+                lockedBalance        // 抵押品数量
             );
+        // 返回值：实际铸造的期权代币数量，通常等于 lockedBalance
 
+        // 🎪 第九步：为购买队列预分配期权（机构优先购买权）
+        // 将铸造期权的一定比例（默认50%）分配给 OptionsPurchaseQueue
+        // 这让机构客户可以在公开拍卖之前优先购买期权
         VaultLifecycle.allocateOptions(
-            optionsPurchaseQueue,
-            newOption,
-            optionsMintAmount,
-            VaultLifecycle.QUEUE_OPTION_ALLOCATION
+            optionsPurchaseQueue,                        // 购买队列合约地址
+            newOption,                                   // 期权合约地址
+            optionsMintAmount,                          // 总期权数量
+            VaultLifecycle.QUEUE_OPTION_ALLOCATION      // 分配比例（50% = 5000）
         );
+        // 例如：铸造1000个期权，分配500个给队列，剩余500个进入拍卖
 
+        // 🔥 第十步：启动期权公开拍卖
+        // 将剩余的期权通过 Gnosis Auction 进行公开竞价销售
         _startAuction();
+        // 拍卖将确定期权的最终市场价格，通常持续6小时
     }
 
     /**
