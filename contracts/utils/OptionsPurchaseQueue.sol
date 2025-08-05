@@ -12,6 +12,13 @@ import {IOptionsPurchaseQueue} from "../interfaces/IOptionsPurchaseQueue.sol";
 import {IRibbonThetaVault} from "../interfaces/IRibbonThetaVault.sol";
 import {Vault} from "../libraries/Vault.sol";
 
+/**
+OptionsPurchaseQueue 是一个 期权买卖中介合约，作为 Ribbon 金库和期权买家之间的桥梁：
+🎪 买家排队系统: 用户可以提前排队购买期权
+💰 价格保护机制: 设置最高购买价格（ceiling price）
+⚡ 优先分配: 金库优先满足队列需求，再进行拍卖
+🔄 FIFO 执行: 先进先出的公平分配机制
+ */
 contract OptionsPurchaseQueue is IOptionsPurchaseQueue, Ownable {
     using SafeERC20 for IERC20;
 
@@ -263,6 +270,7 @@ contract OptionsPurchaseQueue is IOptionsPurchaseQueue, Ownable {
                         ? purchaseQueue[i].optionsAmount
                         : allocatedOptions;
 
+                // 💰 按拍卖结算价格计算费用
                 // premiums = optionsAmount * settlementPrice
                 uint256 premiums =
                     (optionsAmount * settlementPrice) /
@@ -459,6 +467,10 @@ contract OptionsPurchaseQueue is IOptionsPurchaseQueue, Ownable {
         override
         returns (uint256)
     {
+        // 🧮 计算实际可分配数量
+        // 队列剩余需求 = 总需求 - 已分配数量
+        // 如果剩余需求小于最大分配量，则分配剩余需求
+        // 否则分配最大分配量
         // Prevent the vault from allocating more options than there are requested
         uint256 optionsAmount =
             totalOptionsAmount[vault] - vaultAllocatedOptions[vault];

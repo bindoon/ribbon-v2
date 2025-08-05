@@ -17,10 +17,39 @@ Ribbon Finance v2 是一个去中心化期权协议，主要包含以下核心�
 
 ### 1. 金库类型 (Vault Types)
 
-- **Theta Vault**: 核心期权销售金库，定期出售看涨/看跌期权
-- **Treasury Vault**: 国库金库，为其他 DeFi 协议提供期权策略
-- **STETH Vault**: 专门处理 Staked ETH 的金库
-- **Yearn Vault**: 集成 Yearn 协议的复合收益金库
+**🎯 核心 Theta 金库**：
+- **Base Theta Vault**: 基础期权销售金库，支持 ETH、WBTC 等主流资产的看涨/看跌期权策略
+- **Theta Vault with Swap**: 集成链下竞价机制的期权金库，通过 Swap Contract 实现更高效的期权销售
+
+**🏛️ 资产专用金库**：
+- **STETH Theta Vault**: 专门处理 Lido 质押 ETH（stETH）的期权金库，享受质押收益 + 期权溢价双重收益
+- **RETH Theta Vault**: 专门处理 Rocket Pool ETH（rETH）的期权金库，集成去中心化 ETH 质押
+- **Yearn Theta Vault**: 集成 Yearn 协议的复合收益金库，资产在非期权期间自动进入 Yearn 策略
+
+**🏦 国库金库系列**：
+- **Treasury Vault**: 标准国库金库，为 DeFi 协议提供期权策略管理服务
+- **Treasury Vault Bare**: 精简版国库金库，适用于无 Chainlink 价格预言机的资产
+- **Treasury Vault Lite**: 轻量版国库金库，简化版功能适合特定场景
+- **Autocall Vault**: 自动赎回金库，提供结构化产品功能
+
+**🛡️ 安全机制**：
+- **Vault Pauser**: 金库暂停器，紧急情况下可暂停金库操作以保护用户资金
+
+🔄 **期权创建流程映射**
+
+每种金库都通过对应的生命周期管理库参与期权创建：
+
+```typescript
+// 金库 → 生命周期库 → 期权创建
+Base Theta Vault → VaultLifecycle → commitAndClose() → OToken Factory
+STETH Vault → VaultLifecycleSTETH → commitAndClose() → OToken Factory  
+Swap Vault → VaultLifecycleWithSwap → commitNextOption() → OToken Factory
+Yearn Vault → VaultLifecycleYearn → commitAndClose() → OToken Factory
+Treasury Vault → VaultLifecycleTreasury → commitAndClose() → OToken Factory
+```
+
+所有生命周期库最终都调用 **Opyn 的 OToken Factory** 来创建或获取期权合约，实现了统一的期权创建标准。
+
 
 ### 2. 期权管理系统
 
@@ -172,21 +201,26 @@ function _getOTokenPremium(
 
 ##### 拍卖机制设计原理
 
-```mermaid
-graph LR
-    A[金库创建期权] --> B[设置拍卖参数]
-    B --> C[启动拍卖]
-    C --> D[用户提交竞价]
-    D --> E[拍卖结束]
-    E --> F[按价格排序分配]
-    F --> G[结算资金]
-    
-    style A fill:#e3f2fd
-    style F fill:#c8e6c9
-    style G fill:#fff3e0
+期权拍卖是 Ribbon Finance 的核心机制，解决了去中心化期权销售的关键问题：
+
+**🎯 拍卖的核心价值**：
+1. **价格发现**: 通过竞争性竞价发现期权的真实市场价值
+2. **公平分配**: 确保所有参与者都有平等机会购买期权
+3. **最大化收益**: 竞争性环境帮助金库获得最优的期权销售价格
+4. **透明度**: 链上拍卖过程完全透明，避免暗箱操作
+
+**📊 拍卖基本流程**：
+```
+金库创建期权 → 设置最低价格 → 启动拍卖 → 用户竞价 → 按价格分配 → 结算资金
 ```
 
-##### 两种拍卖方式对比
+**🔄 资金流程核心**：
+1. **启动阶段**: Ribbon 将期权 approve 给 Gnosis，但资金仍在金库
+2. **竞价阶段**: 买家在 Gnosis 合约中锁定竞价资金
+3. **结算阶段**: Gnosis 自动匹配订单，确定清算价格
+4. **提取阶段**: Ribbon 调用 `claimFromParticipantOrder` 获取销售收益
+
+**⚖️ 两种拍卖方式对比**：
 
 | 特性 | Gnosis Auction | Swap Contract |
 |------|----------------|---------------|
@@ -196,85 +230,10 @@ graph LR
 | **用户体验** | 需要等待拍卖结束 | 即时响应 |
 | **适用场景** | 大额期权销售 | 小额频繁交易 |
 
-**Gnosis Auction 方式**:
-```solidity
-struct AuctionDetails {
-    address auctioningToken;    // 拍卖的期权代币
-    address biddingToken;       // 竞价代币（如 USDC）
-    uint256 orderCancellationEndDate;  // 取消订单截止时间
-    uint256 auctionEndDate;     // 拍卖结束时间
-    uint96 auctionedSellAmount; // 拍卖数量
-    uint96 minBuyAmount;        // 最低购买金额
-    uint256 minimumBiddingAmountPerOrder; // 单次最小竞价
-    uint256 minFundingThreshold; // 最小资金门槛
-}
-
-function startAuction(AuctionDetails calldata auctionDetails)
-    external returns (uint256 auctionId) {
-    // 验证拍卖参数
-    require(auctionDetails.auctioningToken != address(0), "Invalid token");
-    require(auctionDetails.auctionEndDate > block.timestamp, "Invalid end time");
-    
-    // 启动 Gnosis 拍卖
-    return GnosisAuction.startAuction(auctionDetails);
-}
-```
-
-**拍卖参与流程**:
-```solidity
-// 用户参与拍卖
-function placeSellOrders(
-    uint256 auctionId,
-    uint96[] memory _minBuyAmounts,
-    uint96[] memory _sellAmounts,
-    bytes32[] memory _prevSellOrders
-) external {
-    // 用户提交竞价订单
-    // 订单按价格排序
-    // 拍卖结束后按最优价格分配
-}
-```
-
-**Swap Contract 方式** (新机制):
-```solidity
-// 1. 创建报价
-function createOffer(
-    address oToken,
-    address biddingToken,
-    uint96 minPrice,      // 最低价格
-    uint96 minBidSize,    // 最小竞价数量
-    uint128 totalSize     // 总数量
-) external returns (uint256 swapId) {
-    // 验证期权有效性
-    require(IOtoken(oToken).expiryTimestamp() > block.timestamp, "Expired option");
-    
-    // 创建链下竞价报价
-    offers[swapId] = Offer({
-        seller: msg.sender,
-        oToken: oToken,
-        biddingToken: biddingToken,
-        minPrice: minPrice,
-        totalSize: totalSize,
-        availableSize: totalSize
-    });
-    
-    return swapId;
-}
-
-// 2. 结算竞价（支持批量处理）
-function settleOffer(
-    uint256 swapId,
-    Bid[] calldata bids   // 链下签名的竞价
-) external {
-    Offer storage offer = offers[swapId];
-    require(offer.seller != address(0), "Invalid offer");
-    
-    // 验证签名和执行交易
-    for (uint i = 0; i < bids.length; i++) {
-        _validateAndExecuteBid(swapId, bids[i]);
-    }
-}
-```
+**🛡️ 关键理解要点**：
+- **Opyn 作用**: 仅提供期权合约标准化，不参与定价
+- **拍卖价值**: 通过市场竞争实现期权的真实价格发现
+- **资金安全**: 分阶段转移机制，确保资金安全和可追溯
 
 ##### 拍卖收益分配机制
 
@@ -866,6 +825,17 @@ await gnosisAuction.placeSellOrders(
 // 最终成交价格：0.017 ETH 每个期权
 ```
 
+```
+// 🔄 拍卖过程中的代币转移
+1. Ribbon 授权 oToken 给 Gnosis: 
+   IERC20(oTokenAddress).approve(gnosisEasyAuction, oTokenBalance)
+
+2. Gnosis 拍卖结算时自动转移:
+   oToken: Gnosis → 各个中标买家钱包
+   资金: 买家钱包 → Gnosis 托管
+
+3. 买家直接拥有 oToken ERC20 代币
+```
 **10. 拍卖结算**
 ```typescript
 // 6小时后拍卖结束，按价格排序分配
@@ -879,6 +849,17 @@ await gnosisAuction.placeSellOrders(
 
 // 金库总资产更新
 总资产 = 520 ETH (锁定) + 7.956 ETH (净收益) = 527.956 ETH
+```
+```
+// 📊 拍卖结算后的资金流向
+拍卖结束后:
+1. 🎫 oToken: Ribbon → Gnosis → 各买家钱包 (自动转移)
+2. 💰 USDC/ETH: 买家钱包 → Gnosis (托管)
+
+Ribbon 提取收益:
+3. 📤 调用: claimFromParticipantOrder(auctionID, orders)
+4. 💸 资金: Gnosis → Ribbon 金库
+5. 📈 更新金库总资产，用户受益
 ```
 
 #### 第五阶段：期权运行期 (下周)
@@ -922,6 +903,15 @@ await vault.connect(keeper).commitAndClose(); // 开始新一轮
 
 // Alice 的收益计算
 // 由于期权被行权，这轮收益为负，但之前积累的收益仍保留
+```
+
+```
+// ⏰ 期权到期时（每周五 8:00 AM UTC）
+Opyn 协议自动执行:
+1. 🔍 检查期权是否价内 (ITM)
+2. 💰 如果价内，自动计算现金结算金额  
+3. 🏦 将结算资金从 Ribbon 的抵押品中扣除
+4. 📋 为买家创建可提取的收益记录
 ```
 
 ### 关键函数调用时序图
@@ -986,6 +976,80 @@ sequenceDiagram
 ## 系统设计图表
 
 ### 产品架构图
+
+```mermaid
+graph TB
+    subgraph "用户接口层"
+        UI[Web3 DApp]
+        API[JSON-RPC API]
+    end
+    
+    subgraph "金库层 (Vault Layer)"
+        TV[Theta Vault<br/>期权销售金库]
+        TRV[Treasury Vault<br/>国库金库]
+        SV[STETH Vault<br/>质押ETH金库]
+        YV[Yearn Vault<br/>复合收益金库]
+    end
+    
+    subgraph "期权管理层 (Option Management)"
+        OF[OToken Factory<br/>期权代币工厂]
+        SS[Strike Selection<br/>执行价格选择]
+        PP[Premium Pricing<br/>溢价定价]
+        VO[Volatility Oracle<br/>波动率预言机]
+    end
+    
+    subgraph "交易层 (Trading Layer)"
+        GA[Gnosis Auction<br/>拍卖机制]
+        SC[Swap Contract<br/>链下竞价机制]
+        PQ[Purchase Queue<br/>购买队列]
+    end
+    
+    subgraph "基础设施层 (Infrastructure)"
+        OG[Opyn Gamma<br/>期权协议]
+        CL[Chainlink<br/>价格预言机]
+        YEARN[Yearn Protocol<br/>收益协议]
+        LIDO[Lido<br/>质押协议]
+    end
+    
+    UI --> TV
+    UI --> TRV
+    UI --> SV
+    UI --> YV
+    
+    TV --> OF
+    TV --> SS
+    TV --> PP
+    TV --> GA
+    TV --> SC
+    
+    TRV --> OF
+    TRV --> SS
+    TRV --> PP
+    TRV --> GA
+    
+    SV --> OF
+    SV --> LIDO
+    
+    YV --> YEARN
+    YV --> OF
+    
+    OF --> OG
+    SS --> VO
+    PP --> VO
+    PP --> CL
+    VO --> CL
+    
+    GA --> PQ
+    SC --> PQ
+    
+    style TV fill:#e3f2fd
+    style TRV fill:#f3e5f5
+    style SV fill:#e8f5e8
+    style YV fill:#fff3e0
+    style OF fill:#ffebee
+    style GA fill:#f1f8e9
+    style SC fill:#f9fbe7
+```
 
 ```mermaid
 graph TB
@@ -1129,41 +1193,6 @@ graph TB
     style SC fill:#ffc107,color:#000
 ```
 
-#### 📋 **金库类型详细说明**
-
-**🎯 核心 Theta 金库**：
-- **Base Theta Vault**: 基础期权销售金库，支持 ETH、WBTC 等主流资产的看涨/看跌期权策略
-- **Theta Vault with Swap**: 集成链下竞价机制的期权金库，通过 Swap Contract 实现更高效的期权销售
-
-**🏛️ 资产专用金库**：
-- **STETH Theta Vault**: 专门处理 Lido 质押 ETH（stETH）的期权金库，享受质押收益 + 期权溢价双重收益
-- **RETH Theta Vault**: 专门处理 Rocket Pool ETH（rETH）的期权金库，集成去中心化 ETH 质押
-- **Yearn Theta Vault**: 集成 Yearn 协议的复合收益金库，资产在非期权期间自动进入 Yearn 策略
-
-**🏦 国库金库系列**：
-- **Treasury Vault**: 标准国库金库，为 DeFi 协议提供期权策略管理服务
-- **Treasury Vault Bare**: 精简版国库金库，适用于无 Chainlink 价格预言机的资产
-- **Treasury Vault Lite**: 轻量版国库金库，简化版功能适合特定场景
-- **Autocall Vault**: 自动赎回金库，提供结构化产品功能
-
-**🛡️ 安全机制**：
-- **Vault Pauser**: 金库暂停器，紧急情况下可暂停金库操作以保护用户资金
-
-#### 🔄 **期权创建流程映射**
-
-每种金库都通过对应的生命周期管理库参与期权创建：
-
-```typescript
-// 金库 → 生命周期库 → 期权创建
-Base Theta Vault → VaultLifecycle → commitAndClose() → OToken Factory
-STETH Vault → VaultLifecycleSTETH → commitAndClose() → OToken Factory  
-Swap Vault → VaultLifecycleWithSwap → commitNextOption() → OToken Factory
-Yearn Vault → VaultLifecycleYearn → commitAndClose() → OToken Factory
-Treasury Vault → VaultLifecycleTreasury → commitAndClose() → OToken Factory
-```
-
-所有生命周期库最终都调用 **Opyn 的 OToken Factory** 来创建或获取期权合约，实现了统一的期权创建标准。
-
 ### 用例图
 
 ```mermaid
@@ -1242,78 +1271,99 @@ sequenceDiagram
     participant U as 用户
     participant V as Theta Vault
     participant K as Keeper
-    participant SS as Strike Selection
-    participant OF as OToken Factory
-    participant PP as Premium Pricer
-    participant VO as Volatility Oracle
-    participant SC as Swap Contract
+    participant OP as Opyn Protocol
+    participant GN as Gnosis Auction
     participant B as 买家
     
-    Note over U,B: 第一阶段：用户存款
-    U->>V: deposit(amount)
-    V->>V: 铸造金库代币
-    V->>U: 返回金库代币
+    Note over U,B: 第一阶段：用户存款 💰
+    U->>+V: deposit(10 ETH)
+    Note right of V: 💰 资金: 用户 → 金库
+    V->>V: 铸造 9.52 rETH-THETA
+    V->>-U: 返回金库代币
     
-    Note over U,B: 第二阶段：期权创建
-    K->>V: setMinPrice(minPrice)
+    Note over U,B: 第二阶段：期权创建 🏭
+    K->>+V: setMinPrice(0.015 ETH)
     V->>V: 设置最低价格
     
     K->>V: commitAndClose()
-    V->>SS: getStrikePrice(expiry, isPut)
-    SS->>VO: annualizedVol(optionId)
-    VO-->>SS: 返回波动率
-    SS-->>V: 返回执行价格和delta
+    V->>V: 计算执行价格($3,300)
     
-    V->>OF: getOrDeployOtoken(params)
-    OF->>OF: 创建或获取期权合约
-    OF-->>V: 返回期权地址
+    V->>+OP: getOrDeployOtoken(params)
+    Note right of OP: 🏭 创建期权合约
+    OP->>OP: createOtoken() or getOtoken()
+    OP->>-V: 返回期权地址 0x789...123
     
-    V->>PP: getPremium(strike, expiry, isPut)
-    PP-->>V: 返回期权溢价
+    V->>V: 计算期权溢价
+    V->>-K: 期权创建完成
     
-    Note over U,B: 第三阶段：期权销售
-    K->>V: rollToNextOption()
-    V->>V: 开启期权卖空头寸
+    Note over U,B: 第三阶段：期权销售拍卖 🔨
+    K->>+V: rollToNextOption()
+    V->>V: 锁定 520 ETH 作为抵押
     
-    alt Swap Contract 方式
-        V->>SC: createOffer(oToken, biddingToken, minPrice, totalSize)
-        SC-->>V: 返回 swapId
-        
-        B->>SC: 提交链下签名竞价
-        K->>SC: settleOffer(swapId, bids)
-        SC->>V: 转移期权收益
-        
-    else Gnosis Auction 方式
-        V->>V: startAuction(auctionDetails)
-        B->>V: 参与拍卖竞价
-        V->>V: settleAuction()
+    V->>+OP: 铸造 520 个期权合约
+    Note right of OP: 💎 抵押: 金库 → Opyn(520 ETH)
+    OP->>OP: mint(520 otokens)
+    OP->>-V: 返回 520 个期权代币
+    
+    V->>+GN: startAuction(520个期权, 最低0.015ETH)
+    Note right of GN: 🎯 approve: 期权 → Gnosis
+    GN->>GN: initiateAuction()
+    GN->>-V: 返回 auctionID = 123
+    V->>-K: 拍卖启动完成
+    
+    Note over U,B: 第四阶段：竞价和成交 💸
+    B->>+GN: placeSellOrders(0.017 ETH, 100个期权)
+    Note right of GN: 💰 资金: 买家 → Gnosis托管
+    GN->>GN: 收集所有竞价
+    
+    K->>GN: settleAuction(auctionID=123)
+    GN->>GN: 确定清算价格 0.017 ETH
+    
+    Note right of GN: 🔄 资金转移开始
+    GN->>B: 转移 100个期权代币
+    GN->>GN: 托管拍卖收益 8.84 ETH
+    GN->>-K: 拍卖结算完成
+    
+    K->>+V: claimAuctionOtokens()
+    V->>+GN: claimFromParticipantOrder(orderData)
+    Note right of GN: 💰 收益: Gnosis → 金库(8.84 ETH)
+    GN->>-V: 转移拍卖收益
+    V->>V: 扣除费用，更新金库资产
+    V->>-K: 收益提取完成
+    
+    Note over U,B: 第五阶段：期权到期处理 ⏰
+    Note over V,OP: 等待期权到期(下周五)...
+    
+    alt 期权价内(ETH=$3,500)
+        K->>+V: 期权结算处理
+        V->>+OP: settleOption()
+        Note right of OP: 💸 行权: Opyn → 买家(29.7 ETH)
+        OP->>B: 支付现金结算收益
+        OP->>-V: 释放剩余抵押品
+        V->>-K: 价内结算完成
+    else 期权价外(ETH=$3,200)
+        K->>+V: burnRemainingOTokens()
+        V->>+OP: 销毁期权，释放抵押品
+        Note right of OP: 🔓 释放: Opyn → 金库(520 ETH)
+        OP->>-V: 返回全部抵押品
+        V->>-K: 价外结算完成
     end
     
-    Note over U,B: 第四阶段：期权到期处理
-    Note over V: 等待期权到期...
-    
-    alt 期权价内
-        V->>V: settleOption()
-        V->>V: 支付行权收益
-    else 期权价外
-        V->>V: burnRemainingOTokens()
-        V->>V: 销毁剩余期权
-    end
-    
-    V->>V: 释放抵押品
     V->>V: 分配收益给用户
     
-    Note over U,B: 第五阶段：用户提款
-    U->>V: initiateWithdraw(shares)
+    Note over U,B: 第六阶段：用户提款 🏧
+    U->>+V: initiateWithdraw(shares)
     V->>V: 标记提款请求
+    V->>-U: 锁定代币
     
     Note over V: 等待周期结束...
     
-    U->>V: completeWithdraw()
+    U->>+V: completeWithdraw()
     V->>V: 计算提款金额
-    V->>U: 转移资产
+    Note right of V: 💰 资金: 金库 → 用户
+    V->>-U: 转移资产
     
-    Note over U,B: 周期重复
+    Note over U,B: 周期重复 🔄
     rect rgb(240, 248, 255)
         Note over K,V: 新周期开始，重复上述流程
     end
@@ -1323,6 +1373,12 @@ sequenceDiagram
 
 ```mermaid
 graph TD
+    subgraph "用户交互层 (User Layer)"
+        USER[用户<br/>User]
+        BUYER[期权买家<br/>Option Buyer]
+        KEEPER[Keeper<br/>运营者]
+    end
+    
     subgraph "金库合约组 (Vault Contracts)"
         RTV[RibbonThetaVault<br/>主金库合约]
         VL[VaultLifecycle<br/>生命周期管理]
@@ -1343,50 +1399,86 @@ graph TD
     end
     
     subgraph "交易合约 (Trading Contracts)"
+        GA[GnosisAuction<br/>链上拍卖合约]
         SWP[Swap<br/>链下竞价合约]
-        GA[GnosisAuction<br/>拍卖合约]
         OPQ[OptionsPurchaseQueue<br/>购买队列]
     end
     
     subgraph "外部协议 (External Protocols)"
+        OPYN[Opyn Gamma Protocol<br/>期权基础设施]
+        GNOSIS[Gnosis Easy Auction<br/>拍卖基础设施]
         CL[Chainlink<br/>价格预言机]
-        OPYN[Opyn Gamma<br/>期权基础设施]
-        GNOSIS[Gnosis Safe<br/>多签钱包]
     end
     
+    subgraph "资金流向标记 (Fund Flow)"
+        F1[💰 用户存款]
+        F2[💎 期权抵押]
+        F3[🔨 拍卖收益]
+        F4[💸 行权收益]
+    end
+    
+    %% 用户交互
+    USER -->|deposit/withdraw| RTV
+    USER -.->|F1| RTV
+    BUYER -->|bid| GA
+    BUYER -->|bid| SWP
+    KEEPER -->|manage| RTV
+    KEEPER -->|operate| VL
+    
     %% 主要交互关系
-    RTV --> VL
-    RTV --> VS
-    RTV --> DSS
-    RTV --> MSS
-    RTV --> OPP
-    RTV --> SWP
-    RTV --> GA
+    RTV -->|调用| VL
+    RTV -->|存储| VS
+    RTV -->|使用| DSS
+    RTV -->|使用| MSS
+    RTV -->|查询| OPP
+    RTV -->|销售| GA
+    RTV -->|销售| SWP
     
-    VL --> OTF
-    VL --> OPP
+    VL -->|创建期权| OTF
+    VL -->|定价| OPP
+    VL -.->|F2| OPYN
     
-    OTF --> OT
-    OTF --> CTRL
-    OTF --> OPYN
+    %% Opyn 协议集成
+    OTF -->|属于| OPYN
+    OT -->|属于| OPYN
+    CTRL -->|属于| OPYN
+    OPYN -->|mint| OT
+    OPYN -->|manage| CTRL
+    OPYN -.->|F2 抵押管理| VL
+    OPYN -.->|F4 行权支付| BUYER
     
-    DSS --> OPP
-    DSS --> MVO
-    MSS --> MVO
+    %% Gnosis 协议集成
+    GA -->|使用| GNOSIS
+    GNOSIS -->|auction| BUYER
+    GNOSIS -.->|F3 拍卖收益| RTV
     
-    OPP --> MVO
-    OPP --> CL
+    %% 定价系统
+    DSS -->|查询| OPP
+    DSS -->|使用| MVO
+    MSS -->|使用| MVO
+    OPP -->|查询| MVO
+    OPP -->|查询| CL
     
-    SWP --> OPQ
-    GA --> OPQ
+    %% 交易系统
+    SWP -->|管理| OPQ
+    GA -->|管理| OPQ
     
-    %% 样式
+    %% 样式设定
     style RTV fill:#1976d2,color:#fff
     style VL fill:#388e3c,color:#fff
-    style SWP fill:#f57c00,color:#fff
+    style OPYN fill:#ff9800,color:#fff
+    style GNOSIS fill:#9c27b0,color:#fff
     style GA fill:#7b1fa2,color:#fff
+    style SWP fill:#f57c00,color:#fff
     style OTF fill:#d32f2f,color:#fff
     style OPP fill:#0288d1,color:#fff
+    style USER fill:#e3f2fd
+    style BUYER fill:#e8f5e8
+    style KEEPER fill:#f3e5f5
+    style F1 fill:#e1f5fe
+    style F2 fill:#e8f5e8
+    style F3 fill:#fff8e1
+    style F4 fill:#fce4ec
 ```
 
 ### 资金流动图

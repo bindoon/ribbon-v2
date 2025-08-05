@@ -274,19 +274,31 @@ library VaultLifecycle {
      * @param oTokenAddress is the address of the otoken to mint
      * @param depositAmount is the amount of collateral to deposit
      * @return the otoken mint amount
+     * 
+     * 🎯 创建 Opyn 空头头寸：在 Opyn 协议上存入抵押品并铸造期权代币
+     * 
+     * 核心流程：
+     * 1️⃣ 获取新的 Opyn Vault ID
+     * 2️⃣ 分析期权类型并计算铸造数量
+     * 3️⃣ 授权抵押品给 Opyn
+     * 4️⃣ 构建三个原子操作：开仓、存入抵押品、铸造期权
+     * 5️⃣ 执行批量操作并返回铸造数量
      */
     function createShort(
-        address gammaController,
-        address marginPool,
-        address oTokenAddress,
-        uint256 depositAmount
+        address gammaController,    // 🎮 Opyn 控制器合约地址
+        address marginPool,         // 🏦 Opyn 保证金池地址（存放抵押品）
+        address oTokenAddress,      // 🎫 要铸造的期权代币地址
+        uint256 depositAmount      // 💰 要存入的抵押品数量
     ) external returns (uint256) {
+        // 🎮 第一步：连接 Opyn 控制器并获取新的 Vault ID
+        // Opyn 为每个独立的期权头寸分配唯一的 Vault ID
         IController controller = IController(gammaController);
         uint256 newVaultID =
             (controller.getAccountVaultCounter(address(this))).add(1);
 
-        // An otoken's collateralAsset is the vault's `asset`
-        // So in the context of performing Opyn short operations we call them collateralAsset
+        // 📋 第二步：获取期权合约信息和抵押品详情
+        // 期权的 collateralAsset 就是我们金库的基础资产
+        // 在执行 Opyn 空头操作时，我们称其为 collateralAsset（抵押资产）
         IOtoken oToken = IOtoken(oTokenAddress);
         address collateralAsset = oToken.collateralAsset();
 
@@ -294,78 +306,97 @@ library VaultLifecycle {
             uint256(IERC20Detailed(collateralAsset).decimals());
         uint256 mintAmount;
 
+        // 🔢 第三步：根据期权类型计算铸造数量
         if (oToken.isPut()) {
-            // For minting puts, there will be instances where the full depositAmount will not be used for minting.
-            // This is because of an issue with precision.
+            // 🔻 看跌期权的复杂铸造逻辑
+            // 对于看跌期权，可能存在无法使用全部 depositAmount 的情况
+            // 这是由于精度问题造成的。
             //
-            // For ETH put options, we are calculating the mintAmount (10**8 decimals) using
-            // the depositAmount (10**18 decimals), which will result in truncation of decimals when scaling down.
-            // As a result, there will be tiny amounts of dust left behind in the Opyn vault when minting put otokens.
+            // 对于 ETH 看跌期权，我们使用 depositAmount（18位小数）来计算
+            // mintAmount（8位小数），这会在缩小比例时导致小数截断。
+            // 结果是在铸造看跌期权代币时，Opyn vault 中会留下微量的"灰尘"。
             //
-            // For simplicity's sake, we do not refund the dust back to the address(this) on minting otokens.
-            // We retain the dust in the vault so the calling contract can withdraw the
-            // actual locked amount + dust at settlement.
+            // 为了简化，我们在铸造期权代币时不将"灰尘"退还给 address(this)。
+            // 我们将"灰尘"保留在 vault 中，这样调用合约可以在结算时
+            // 提取实际锁定金额 + 灰尘。
             //
-            // To test this behavior, we can console.log
+            // 要测试这种行为，可以 console.log
             // MarginCalculatorInterface(0x7A48d10f372b3D7c60f6c9770B91398e4ccfd3C7).getExcessCollateral(vault)
-            // to see how much dust (or excess collateral) is left behind.
+            // 来查看留下了多少"灰尘"（或过量抵押品）。
+            
+            // 🧮 看跌期权铸造公式：
+            // mintAmount = (depositAmount * 10^8 * 10^18) / (strikePrice * 10^(10 + collateralDecimals))
             mintAmount = depositAmount
-                .mul(10**Vault.OTOKEN_DECIMALS)
-                .mul(10**18) // we use 10**18 to give extra precision
+                .mul(10**Vault.OTOKEN_DECIMALS)    // 10^8：期权代币精度
+                .mul(10**18)                       // 10^18：额外精度以减少截断
                 .div(oToken.strikePrice().mul(10**(10 + collateralDecimals)));
         } else {
+            // 🔺 看涨期权的简单铸造逻辑
+            // 对于看涨期权，通常是 1:1 的抵押比例
             mintAmount = depositAmount;
 
+            // 🔧 处理小数位数差异
             if (collateralDecimals > 8) {
-                uint256 scaleBy = 10**(collateralDecimals.sub(8)); // oTokens have 8 decimals
+                // 期权代币都是 8 位小数，需要缩放
+                uint256 scaleBy = 10**(collateralDecimals.sub(8)); // 期权代币有8位小数
                 if (mintAmount > scaleBy) {
-                    mintAmount = depositAmount.div(scaleBy); // scale down from 10**18 to 10**8
+                    mintAmount = depositAmount.div(scaleBy); // 从 10^18 缩放到 10^8
                 }
             }
         }
 
-        // double approve to fix non-compliant ERC20s
+        // 💳 第四步：授权抵押品给 Opyn 保证金池
+        // 双重授权以修复不合规的 ERC20 代币问题
         IERC20 collateralToken = IERC20(collateralAsset);
         collateralToken.safeApproveNonCompliant(marginPool, depositAmount);
 
+        // 🎬 第五步：构建三个原子操作
+        // Opyn 使用批量操作模式，一次性执行多个相关动作
         IController.ActionArgs[] memory actions =
             new IController.ActionArgs[](3);
 
+        // 🏗️ 操作1：开启新的 Opyn Vault
         actions[0] = IController.ActionArgs(
-            IController.ActionType.OpenVault,
-            address(this), // owner
-            address(this), // receiver
-            address(0), // asset, otoken
-            newVaultID, // vaultId
-            0, // amount
-            0, //index
-            "" //data
+            IController.ActionType.OpenVault,     // 操作类型：开仓
+            address(this),                        // owner：vault 拥有者（Ribbon金库）
+            address(this),                        // receiver：接收者（Ribbon金库）
+            address(0),                           // asset：期权代币（初始为空）
+            newVaultID,                           // vaultId：新的 vault ID
+            0,                                    // amount：数量（开仓时为0）
+            0,                                    // index：索引
+            ""                                    // data：额外数据
         );
 
+        // 💎 操作2：存入抵押品
         actions[1] = IController.ActionArgs(
-            IController.ActionType.DepositCollateral,
-            address(this), // owner
-            address(this), // address to transfer from
-            collateralAsset, // deposited asset
-            newVaultID, // vaultId
-            depositAmount, // amount
-            0, //index
-            "" //data
+            IController.ActionType.DepositCollateral, // 操作类型：存入抵押品
+            address(this),                        // owner：vault 拥有者
+            address(this),                        // address to transfer from：转出地址
+            collateralAsset,                      // deposited asset：存入的抵押资产
+            newVaultID,                           // vaultId：vault ID
+            depositAmount,                        // amount：存入数量
+            0,                                    // index：索引
+            ""                                    // data：额外数据
         );
 
+        // 🎫 操作3：铸造空头期权
         actions[2] = IController.ActionArgs(
-            IController.ActionType.MintShortOption,
-            address(this), // owner
-            address(this), // address to transfer to
-            oTokenAddress, // option address
-            newVaultID, // vaultId
-            mintAmount, // amount
-            0, //index
-            "" //data
+            IController.ActionType.MintShortOption,  // 操作类型：铸造空头期权
+            address(this),                        // owner：vault 拥有者
+            address(this),                        // address to transfer to：接收地址
+            oTokenAddress,                        // option address：期权合约地址
+            newVaultID,                           // vaultId：vault ID
+            mintAmount,                           // amount：铸造数量
+            0,                                    // index：索引
+            ""                                    // data：额外数据
         );
 
+        // 🚀 第六步：执行批量操作
+        // Opyn 控制器原子性地执行所有三个操作
+        // 如果任何一个操作失败，整个交易都会回滚
         controller.operate(actions);
 
+        // 📊 返回实际铸造的期权代币数量
         return mintAmount;
     }
 
@@ -772,29 +803,56 @@ library VaultLifecycle {
      * @param optionAllocation is the maximum % of options to allocate towards the purchase queue (will only allocate
      *  up to the amount that is on the queue)
      * @return allocatedOptions is the amount of options that ended up getting allocated to the OptionsPurchaseQueue
+     * 
+     * 🎯 分配期权给购买队列：将金库铸造的期权按比例分配给期权购买队列合约
+     * 
+     * 核心流程：
+     * 1️⃣ 检查购买队列是否存在
+     * 2️⃣ 计算理论分配数量（基于设定比例）
+     * 3️⃣ 获取实际可分配数量（受队列需求限制）
+     * 4️⃣ 授权并转移期权到购买队列
+     * 
+     * 优先级：购买队列 > 拍卖销售
      */
     function allocateOptions(
-        address optionsPurchaseQueue,
-        address option,
-        uint256 optionsAmount,
-        uint256 optionAllocation
+        address optionsPurchaseQueue,   // 🛒 期权购买队列合约地址
+        address option,                 // 🎫 铸造的期权合约地址
+        uint256 optionsAmount,          // 📊 金库铸造的期权总数量
+        uint256 optionAllocation        // 📈 分配给购买队列的最大百分比
     ) external returns (uint256 allocatedOptions) {
-        // Skip if optionsPurchaseQueue is address(0)
+        // 🔍 第一步：检查购买队列是否存在
+        // 如果购买队列地址为 0，跳过分配过程
         if (optionsPurchaseQueue != address(0)) {
+            // 🧮 第二步：计算理论分配数量
+            // 根据设定的分配比例计算应该分配给购买队列的期权数量
+            // 公式：理论分配数量 = 期权总数 × 分配比例 / (100 × 乘数)
             allocatedOptions = optionsAmount.mul(optionAllocation).div(
-                100 * Vault.OPTION_ALLOCATION_MULTIPLIER
+                100 * Vault.OPTION_ALLOCATION_MULTIPLIER  // 通常乘数为 10，所以分母是1000
             );
+            
+            // 🎯 第三步：获取实际可分配数量
+            // 购买队列会根据当前的购买需求来限制实际分配数量
+            // 如果队列中的购买需求不足，实际分配数量会小于理论分配数量
             allocatedOptions = IOptionsPurchaseQueue(optionsPurchaseQueue)
                 .getOptionsAllocation(address(this), allocatedOptions);
 
+            // 💳 第四步：执行期权分配（如果有需要分配的数量）
             if (allocatedOptions != 0) {
+                // 🎫 步骤4.1：授权期权代币给购买队列合约
+                // 允许购买队列合约从金库转移指定数量的期权代币
                 IERC20(option).approve(optionsPurchaseQueue, allocatedOptions);
+                
+                // 📤 步骤4.2：调用购买队列的分配函数
+                // 实际将期权代币转移到购买队列中，供用户购买
                 IOptionsPurchaseQueue(optionsPurchaseQueue).allocateOptions(
                     allocatedOptions
                 );
             }
         }
 
+        // 📊 返回实际分配的期权数量
+        // 这个数量可能为0（无购买队列或无需求）
+        // 也可能小于理论分配数量（需求不足）
         return allocatedOptions;
     }
 
@@ -810,10 +868,12 @@ library VaultLifecycle {
         address gnosisEasyAuction,
         uint256 optionAuctionID
     ) external returns (uint256) {
+        // 🎯 从Gnosis拍卖获取结算价格
         uint256 settlementPrice =
             getAuctionSettlementPrice(gnosisEasyAuction, optionAuctionID);
         require(settlementPrice != 0, "!settlementPrice");
-
+        
+        // 📤 用拍卖价格给购买队列结算
         return
             IOptionsPurchaseQueue(optionsPurchaseQueue).sellToBuyers(
                 settlementPrice

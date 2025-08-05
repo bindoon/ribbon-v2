@@ -11,9 +11,9 @@ interface IOptionsPurchaseQueue {
      * @param buyer The buyer requesting this purchase
      */
     struct Purchase {
-        uint128 optionsAmount; // Slot 0
-        uint128 premiums;
-        address buyer; // Slot 1
+        uint128 optionsAmount; // Slot 0 请求购买的期权数量
+        uint128 premiums; // 按最高价预付的溢价
+        address buyer; // Slot 1 购买者地址
     }
 
     function purchases(address, uint256)

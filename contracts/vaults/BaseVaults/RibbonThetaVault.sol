@@ -367,37 +367,64 @@ contract RibbonThetaVault is RibbonVault, RibbonThetaVaultStorage {
     /**
      * @notice Sets the next option the vault will be shorting, and closes the existing short.
      *         This allows all the users to withdraw if the next option is malicious.
+     * 
+     * 🎯 承诺并关闭当前期权：这是金库运营的核心函数，完成期权轮次转换
+     * 
+     * 执行流程：
+     * 1️⃣ 保存当前期权地址（准备关闭）
+     * 2️⃣ 构建期权关闭参数结构体
+     * 3️⃣ 调用 VaultLifecycle 库创建新期权
+     * 4️⃣ 更新期权状态和时间延迟
+     * 5️⃣ 关闭旧期权头寸
      */
     function commitAndClose() external nonReentrant {
+        // 📋 第一步：保存当前期权地址，准备关闭当前轮次
+        // 这个地址可能是 address(0)（首次运行）或上一轮的期权合约地址
         address oldOption = optionState.currentOption;
 
+        // 🏗️ 第二步：构建期权关闭参数结构体
+        // 这个结构体包含创建新期权所需的所有配置信息
         VaultLifecycle.CloseParams memory closeParams =
             VaultLifecycle.CloseParams({
-                OTOKEN_FACTORY: OTOKEN_FACTORY,
-                USDC: USDC,
-                currentOption: oldOption,
-                delay: DELAY,
-                lastStrikeOverrideRound: lastStrikeOverrideRound,
-                overriddenStrikePrice: overriddenStrikePrice,
-                strikeSelection: strikeSelection,
-                optionsPremiumPricer: optionsPremiumPricer,
-                premiumDiscount: premiumDiscount
+                OTOKEN_FACTORY: OTOKEN_FACTORY,           // 🏭 Opyn 期权工厂地址
+                USDC: USDC,                               // 💵 USDC 代币地址（用于看跌期权）
+                currentOption: oldOption,                 // 📋 当前期权地址（即将关闭的）
+                delay: DELAY,                             // ⏰ 安全延迟时间（通常6小时）
+                lastStrikeOverrideRound: lastStrikeOverrideRound,     // 🎯 上次手动覆盖执行价格的轮次
+                overriddenStrikePrice: overriddenStrikePrice,         // 💰 手动覆盖的执行价格
+                strikeSelection: strikeSelection,         // 🧮 执行价格选择策略合约
+                optionsPremiumPricer: optionsPremiumPricer, // 📊 期权定价器合约
+                premiumDiscount: premiumDiscount          // 🎫 期权销售折扣率（如5%）
             });
 
+        // 🚀 第三步：调用核心库函数创建新期权
+        // 这是整个函数的核心，委托给 VaultLifecycle 库处理复杂逻辑：
+        // - 计算新期权的到期时间（下周五）
+        // - 通过算法选择执行价格（Delta-based 或手动）
+        // - 在 Opyn 上创建或获取期权合约
+        // - 计算期权的理论溢价
         (address otokenAddress, uint256 strikePrice, uint256 delta) =
             VaultLifecycle.commitAndClose(closeParams, vaultParams, vaultState);
 
+        // 📢 第四步：发出事件通知，记录新期权的关键信息
+        // 前端和监控系统可以监听这个事件来跟踪金库状态
         emit NewOptionStrikeSelected(strikePrice, delta);
 
+        // 📝 第五步：更新期权状态 - 设置下一个期权地址
+        // 新创建的期权合约地址，将在 rollToNextOption() 中被激活
         optionState.nextOption = otokenAddress;
 
+        // ⏰ 第六步：计算并设置期权准备时间
+        // 添加安全延迟（通常6小时），让用户有时间检查新期权参数
         uint256 nextOptionReady = block.timestamp.add(DELAY);
         require(
-            nextOptionReady <= type(uint32).max,
+            nextOptionReady <= type(uint32).max,    // 🛡️ 防止时间戳溢出
             "Overflow nextOptionReady"
         );
         optionState.nextOptionReadyAt = uint32(nextOptionReady);
 
+        // 🔒 第七步：关闭旧期权头寸
+        // 如果存在旧期权，处理到期结算、释放抵押品等清理工作
         _closeShort(oldOption);
     }
 
@@ -517,18 +544,53 @@ contract RibbonThetaVault is RibbonVault, RibbonThetaVaultStorage {
         _startAuction();
     }
 
+    /**
+     * 🔨 启动期权拍卖：配置并启动 Gnosis 拍卖，将期权出售给市场
+     * 
+     * 核心流程：
+     * 1️⃣ 创建拍卖详情结构体
+     * 2️⃣ 设置期权合约地址
+     * 3️⃣ 配置拍卖基础设施
+     * 4️⃣ 设置资产和定价信息
+     * 5️⃣ 启动 Gnosis 拍卖并获取拍卖ID
+     */
     function _startAuction() private {
+        // 🏗️ 第一步：创建拍卖详情结构体
+        // 这个结构体包含启动 Gnosis 拍卖所需的所有配置信息
         GnosisAuction.AuctionDetails memory auctionDetails;
 
+        // 🎫 第二步：获取当前期权合约地址
+        // 这是在 rollToNextOption() 中设置的，指向当前活跃的期权合约
         address currentOtoken = optionState.currentOption;
 
+        // 📋 第三步：设置期权合约信息
+        // 告诉 Gnosis 拍卖哪个 ERC20 代币（期权）将被拍卖
         auctionDetails.oTokenAddress = currentOtoken;
+        
+        // 🏛️ 第四步：设置 Gnosis 拍卖合约地址
+        // GNOSIS_EASY_AUCTION 是部署的 Gnosis Easy Auction 合约地址
+        // 这是拍卖的基础设施提供方
         auctionDetails.gnosisEasyAuction = GNOSIS_EASY_AUCTION;
+        
+        // 💰 第五步：设置资产和小数位信息
+        // asset: 用于竞价的资产（如 USDC、ETH）
+        // assetDecimals: 资产的小数位数（如 USDC=6, ETH=18）
         auctionDetails.asset = vaultParams.asset;
         auctionDetails.assetDecimals = vaultParams.decimals;
+        
+        // 💵 第六步：设置期权溢价（最低竞价价格）
+        // currentOtokenPremium 是通过 Black-Scholes 模型计算的期权理论价值
+        // 这将作为拍卖的起始价格或最低价格
         auctionDetails.oTokenPremium = currentOtokenPremium;
+        
+        // ⏰ 第七步：设置拍卖持续时间
+        // auctionDuration 通常为 6 小时（21600 秒）
+        // 在此期间用户可以提交竞价
         auctionDetails.duration = auctionDuration;
 
+        // 🚀 第八步：启动 Gnosis 拍卖并保存拍卖ID
+        // 委托给 VaultLifecycle 库函数执行实际的拍卖启动逻辑
+        // 返回的 optionAuctionID 用于后续跟踪和结算拍卖
         optionAuctionID = VaultLifecycle.startAuction(auctionDetails);
     }
 

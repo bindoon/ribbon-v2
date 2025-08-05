@@ -57,15 +57,18 @@ library GnosisAuction {
         internal
         returns (uint256 auctionID)
     {
+        // 🎯 第1步：计算要销售的 oToken 数量
         uint256 oTokenSellAmount =
             getOTokenSellAmount(auctionDetails.oTokenAddress);
         require(oTokenSellAmount > 0, "No otokens to sell");
-
+        // 💰 第2步：批准 Gnosis 转移 oToken（关键！）
+        // 将合约中所有 oToken 授权给 Gnosis 合约，允许 Gnosis 在拍卖期间转移这些 oToken
         IERC20(auctionDetails.oTokenAddress).safeApprove(
             auctionDetails.gnosisEasyAuction,
             IERC20(auctionDetails.oTokenAddress).balanceOf(address(this))
         );
 
+        // 📊 第3步：计算最低竞价金额
         // minBidAmount is total oTokens to sell * premium per oToken
         // shift decimals to correspond to decimals of USDC for puts
         // and underlying for calls
@@ -87,7 +90,7 @@ library GnosisAuction {
         );
 
         uint256 auctionEnd = block.timestamp.add(auctionDetails.duration);
-
+        // 🏭 第4步：在 Gnosis 上创建拍卖
         auctionID = IGnosisAuction(auctionDetails.gnosisEasyAuction)
             .initiateAuction(
             // address of oToken we minted and are selling
