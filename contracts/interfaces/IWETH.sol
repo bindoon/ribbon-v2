@@ -2,9 +2,9 @@
 pragma solidity =0.8.4;
 
 interface IWETH {
-    function deposit() external payable;
+    function deposit() external payable;    // 🔄 ETH → WETH
 
-    function withdraw(uint256) external;
+    function withdraw(uint256) external;    // 🔄 WETH → ETH
 
     function balanceOf(address account) external view returns (uint256);
 

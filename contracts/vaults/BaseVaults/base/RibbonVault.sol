@@ -303,8 +303,24 @@ contract RibbonVault is
         require(vaultParams.asset == WETH, "!WETH");
         require(msg.value > 0, "!value");
 
+        // 📋 第1步：记录用户存款（按 ETH 数量）
         _depositFor(msg.value, msg.sender);
 
+        /**
+        🔄 第2步：关键转换 - ETH → WETH
+        用户: 失去 1 ETH，获得金库份额,
+        金库: 获得 1 WETH，可用于期权抵押,
+        WETH合约: 托管了额外的 1 ETH，发行了 1 WETH 代币
+        这里转为WETH的原因：
+        1. Opyn 协议的硬性要求 - 只接受 ERC20
+        2. ETH 无法直接用于期权抵押，需要转换为 ERC20 代币。没有合约地址: address(ETH) = 不存在,
+        */
+        /** 
+         ERC20.safeTransferFrom 是已经存在的 ERC20 代币。需要 approve 授权，而WETH.deposit不需要授权
+         ERC20.safeTransferFrom 转账后总供应量不变，而WETH.deposit转账后总供应量增加
+         Morpho 主要使用 ERC20 的 WETH 作为抵押品，而 WETH 的合约地址是 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2
+         Ribbon 使用 ETH 作为抵押品，所以需要将 ETH 转换为 WETH
+        */
         IWETH(WETH).deposit{value: msg.value}();
     }
 
